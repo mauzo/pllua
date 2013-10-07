@@ -46,6 +46,27 @@ typedef struct luaP_Plan {
   Oid type[1];
 } luaP_Plan;
 
+#define luaP_TRY \
+    do { \
+        MemoryContext _tryctx = CurrentMemoryContext; \
+        ErrorData *_ed = NULL; \
+        \
+        PG_TRY();
+#define luaP_CATCH \
+        PG_CATCH(); \
+        { \
+            MemoryContextSwitchTo(_tryctx); \
+            _ed = CopyErrorData(); \
+            FlushErrorState(); \
+        } \
+        PG_END_TRY(); \
+        \
+        if (_ed) { \
+            lua_pushstring(L, _ed->message); \
+            FreeErrorData(_ed); \
+            return lua_error(L); \
+        } \
+    } while (0)
 
 /* ======= Utils ======= */
 
@@ -99,7 +120,9 @@ void luaP_pushdesctable (lua_State *L, TupleDesc desc) {
 static int luaP_rowsaux (lua_State *L) {
   luaP_Cursor *c = (luaP_Cursor *) lua_touserdata(L, lua_upvalueindex(1));
   int init = lua_toboolean(L, lua_upvalueindex(2));
-  SPI_cursor_fetch(c->cursor, 1, 1);
+  luaP_TRY {
+    SPI_cursor_fetch(c->cursor, 1, 1);
+  } luaP_CATCH;
   if (SPI_processed > 0) { /* any row? */
     if (!init) { /* register tupdesc */
       lua_pushinteger(L, (int) InvalidOid);
@@ -394,7 +417,9 @@ static int luaP_cursortostring (lua_State *L) {
 
 static int luaP_cursorfetch (lua_State *L) {
   luaP_Cursor *c = (luaP_Cursor *) luaP_checkudata(L, 1, PLLUA_CURSORMT);
-  SPI_cursor_fetch(c->cursor, 1, luaL_optlong(L, 2, FETCH_ALL));
+  luaP_TRY {
+    SPI_cursor_fetch(c->cursor, 1, luaL_optlong(L, 2, FETCH_ALL));
+  } luaP_CATCH;
   if (SPI_processed > 0) /* any rows? */
     luaP_pushtuptable(L, c->cursor);
   else
@@ -404,7 +429,9 @@ static int luaP_cursorfetch (lua_State *L) {
 
 static int luaP_cursormove (lua_State *L) {
   luaP_Cursor *c = (luaP_Cursor *) luaP_checkudata(L, 1, PLLUA_CURSORMT);
-  SPI_cursor_move(c->cursor, 1, luaL_optlong(L, 2, 0));
+  luaP_TRY {
+    SPI_cursor_move(c->cursor, 1, luaL_optlong(L, 2, 0));
+  } luaP_CATCH;
   return 0;
 }
 
@@ -412,7 +439,9 @@ static int luaP_cursormove (lua_State *L) {
 static int luaP_cursorposfetch (lua_State *L) {
   luaP_Cursor *c = (luaP_Cursor *) luaP_checkudata(L, 1, PLLUA_CURSORMT);
   FetchDirection fd = (lua_toboolean(L, 3)) ? FETCH_RELATIVE : FETCH_ABSOLUTE;
-  SPI_scroll_cursor_fetch(c->cursor, fd, luaL_optlong(L, 2, FETCH_ALL));
+  luaP_TRY {
+    SPI_scroll_cursor_fetch(c->cursor, fd, luaL_optlong(L, 2, FETCH_ALL));
+  } luaP_CATCH;
   if (SPI_processed > 0) /* any rows? */
     luaP_pushtuptable(L, c->cursor);
   else
@@ -423,7 +452,9 @@ static int luaP_cursorposfetch (lua_State *L) {
 static int luaP_cursorposmove (lua_State *L) {
   luaP_Cursor *c = (luaP_Cursor *) luaP_checkudata(L, 1, PLLUA_CURSORMT);
   FetchDirection fd = (lua_toboolean(L, 3)) ? FETCH_RELATIVE : FETCH_ABSOLUTE;
-  SPI_scroll_cursor_move(c->cursor, fd, luaL_optlong(L, 2, 0));
+  luaP_TRY {
+    SPI_scroll_cursor_move(c->cursor, fd, luaL_optlong(L, 2, 0));
+  } luaP_CATCH;
   return 0;
 }
 #endif
@@ -453,16 +484,20 @@ static int luaP_executeplan (lua_State *L) {
   luaP_Plan *p = (luaP_Plan *) luaP_checkudata(L, 1, PLLUA_PLANMT);
   bool ro = (bool) lua_toboolean(L, 3);
   long c = luaL_optlong(L, 4, 0);
-  int result;
+  int result = -1;
   if (p->nargs > 0) {
     luaP_Buffer *b;
     if (lua_type(L, 2) != LUA_TTABLE) luaP_typeerror(L, 2, "table");
     b = luaP_getbuffer(L, p->nargs);
     luaP_fillbuffer(L, 2, p->type, b);
-    result = SPI_execute_plan(p->plan, b->value, b->null, ro, c); 
+    luaP_TRY {
+      result = SPI_execute_plan(p->plan, b->value, b->null, ro, c); 
+    } luaP_CATCH;
   }
   else
-    result = SPI_execute_plan(p->plan, NULL, NULL, ro, c); 
+    luaP_TRY {
+      result = SPI_execute_plan(p->plan, NULL, NULL, ro, c); 
+    } luaP_CATCH;
   if (result < 0)
     return luaL_error(L, "SPI_execute_plan error: %d", result);
   if (result == SPI_OK_SELECT && SPI_processed > 0) /* any rows? */
@@ -495,17 +530,21 @@ static int luaP_getcursorplan (lua_State *L) {
   luaP_Plan *p = (luaP_Plan *) luaP_checkudata(L, 1, PLLUA_PLANMT);
   bool ro = (bool) lua_toboolean(L, 3);
   const char *name = lua_tostring(L, 4);
-  Portal cursor;
+  Portal cursor = NULL;
   if (SPI_is_cursor_plan(p->plan)) {
     if (p->nargs > 0) {
       luaP_Buffer *b;
       if (lua_type(L, 2) != LUA_TTABLE) luaP_typeerror(L, 2, "table");
       b = luaP_getbuffer(L, p->nargs);
       luaP_fillbuffer(L, 2, p->type, b);
-      cursor = SPI_cursor_open(name, p->plan, b->value, b->null, ro);
+      luaP_TRY {
+        cursor = SPI_cursor_open(name, p->plan, b->value, b->null, ro);
+      } luaP_CATCH;
     }
     else
-      cursor = SPI_cursor_open(name, p->plan, NULL, NULL, ro);
+      luaP_TRY {
+        cursor = SPI_cursor_open(name, p->plan, NULL, NULL, ro);
+      } luaP_CATCH;
     if (cursor == NULL)
       return luaL_error(L, "error opening cursor");
     luaP_pushcursor(L, cursor);
@@ -516,7 +555,7 @@ static int luaP_getcursorplan (lua_State *L) {
 
 static int luaP_rowsplan (lua_State *L) {
   luaP_Plan *p = (luaP_Plan *) luaP_checkudata(L, 1, PLLUA_PLANMT);
-  Portal cursor;
+  Portal cursor = NULL;
   if (!SPI_is_cursor_plan(p->plan))
     return luaL_error(L, "Plan is not iterable");
   if (p->nargs > 0) {
@@ -524,10 +563,14 @@ static int luaP_rowsplan (lua_State *L) {
     if (lua_type(L, 2) != LUA_TTABLE) luaP_typeerror(L, 2, "table");
     b = luaP_getbuffer(L, p->nargs);
     luaP_fillbuffer(L, 2, p->type, b);
-    cursor = SPI_cursor_open(NULL, p->plan, b->value, b->null, 1);
+    luaP_TRY {
+      cursor = SPI_cursor_open(NULL, p->plan, b->value, b->null, 1);
+    } luaP_CATCH;
   }
   else
-    cursor = SPI_cursor_open(NULL, p->plan, NULL, NULL, 1);
+    luaP_TRY {
+      cursor = SPI_cursor_open(NULL, p->plan, NULL, NULL, 1);
+    } luaP_CATCH;
   if (cursor == NULL)
     return luaL_error(L, "error opening cursor");
   luaP_pushcursor(L, cursor);
@@ -581,7 +624,9 @@ static int luaP_prepare (lua_State *L) {
       lua_pop(L, 1);
     }
   }
-  p->plan = SPI_prepare_cursor(q, nargs, p->type, cursoropt);
+  luaP_TRY {
+    p->plan = SPI_prepare_cursor(q, nargs, p->type, cursoropt);
+  } luaP_CATCH;
   if (SPI_result < 0)
     return luaL_error(L, "SPI_prepare error: %d", SPI_result);
   luaP_getfield(L, PLLUA_PLANMT);
@@ -590,8 +635,11 @@ static int luaP_prepare (lua_State *L) {
 }
 
 static int luaP_execute (lua_State *L) {
-  int result = SPI_execute(luaL_checkstring(L, 1),
+  int result = -1;
+  luaP_TRY {
+    result = SPI_execute(luaL_checkstring(L, 1),
       (bool) lua_toboolean(L, 2), luaL_optlong(L, 3, 0));
+  } luaP_CATCH;
   if (result < 0)
     return luaL_error(L, "SPI_execute_plan error: %d", result);
   if (result == SPI_OK_SELECT && SPI_processed > 0) /* any rows? */
@@ -610,13 +658,18 @@ static int luaP_find (lua_State *L) {
 }
 
 static int luaP_rows (lua_State *L) {
-  Portal cursor;
-  SPI_plan *p = SPI_prepare_cursor(luaL_checkstring(L, 1), 0, NULL, 0);
+  Portal cursor = NULL;
+  SPI_plan *p = NULL;
+  luaP_TRY {
+    p = SPI_prepare_cursor(luaL_checkstring(L, 1), 0, NULL, 0);
+  } luaP_CATCH;
   if (SPI_result < 0)
     return luaL_error(L, "SPI_prepare error: %d", SPI_result);
   if (!SPI_is_cursor_plan(p))
     return luaL_error(L, "Statement is not iterable");
-  cursor = SPI_cursor_open(NULL, p, NULL, NULL, 1);
+  luaP_TRY {
+    cursor = SPI_cursor_open(NULL, p, NULL, NULL, 1);
+  } luaP_CATCH;
   if (cursor == NULL)
     return luaL_error(L, "error opening cursor");
   luaP_pushcursor(L, cursor);
