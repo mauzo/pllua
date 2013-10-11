@@ -19,6 +19,7 @@ static const char PLLUA_TUPLEMT[] = "tuple";
 static const char PLLUA_PLANMT[] = "plan";
 static const char PLLUA_CURSORMT[] = "cursor";
 static const char PLLUA_TUPTABLEMT[] = "tupletable";
+static const char PLLUA_TXNABORT[] = "luaP_txn_abort";
 
 typedef struct luaP_Tuple {
   int changed;
@@ -45,28 +46,6 @@ typedef struct luaP_Plan {
   SPI_plan *plan;
   Oid type[1];
 } luaP_Plan;
-
-#define luaP_TRY \
-    do { \
-        MemoryContext _tryctx = CurrentMemoryContext; \
-        ErrorData *_ed = NULL; \
-        \
-        PG_TRY();
-#define luaP_CATCH \
-        PG_CATCH(); \
-        { \
-            MemoryContextSwitchTo(_tryctx); \
-            _ed = CopyErrorData(); \
-            FlushErrorState(); \
-        } \
-        PG_END_TRY(); \
-        \
-        if (_ed) { \
-            lua_pushstring(L, _ed->message); \
-            FreeErrorData(_ed); \
-            return lua_error(L); \
-        } \
-    } while (0)
 
 /* ======= Utils ======= */
 
@@ -106,6 +85,58 @@ static void *luaP_checkudata (lua_State *L, int ud, const char *tname) {
   if (p == NULL) luaP_typeerror(L, ud, tname);
   return p;
 }
+
+static void luaP_checkabort (lua_State *L) {
+  luaP_getfield(L, PLLUA_TXNABORT);
+  if (lua_isnil(L, -1)) {
+    lua_pop(L, 1);
+    return;
+  }
+  luaL_error(L, "transaction is aborted");
+}
+
+static void luaP_throwsqlerr (lua_State *L, ErrorData *ed) {
+  SPI_restore_connection();
+  lua_pushstring(L, ed->message);
+  FreeErrorData(ed);
+  lua_pushlightuserdata(L, (void *)PLLUA_TXNABORT);
+  lua_pushvalue(L, -2);
+  lua_rawset(L, LUA_REGISTRYINDEX);
+  lua_error(L);
+}
+
+int luaP_clearabort (lua_State *L) {
+  luaP_getfield(L, PLLUA_TXNABORT);
+  if (lua_isnil(L, -1)) {
+    lua_pop(L, 1);
+    return 0;
+  }
+  elog(INFO, "clearing pllua abort state");
+  lua_pushlightuserdata(L, (void *)PLLUA_TXNABORT);
+  lua_pushnil(L);
+  lua_rawset(L, LUA_REGISTRYINDEX);
+  return 1;
+}
+
+#define luaP_TRY \
+  do { \
+    MemoryContext _tryctx = CurrentMemoryContext; \
+    ErrorData *_ed = NULL; \
+    \
+    luaP_checkabort(L); \
+    \
+    PG_TRY();
+#define luaP_CATCH \
+    PG_CATCH(); \
+    { \
+      MemoryContextSwitchTo(_tryctx); \
+      _ed = CopyErrorData(); \
+      FlushErrorState(); \
+    } \
+    PG_END_TRY(); \
+    \
+    if (_ed) luaP_throwsqlerr(L, _ed); \
+  } while (0)
 
 void luaP_pushdesctable (lua_State *L, TupleDesc desc) {
   int i;

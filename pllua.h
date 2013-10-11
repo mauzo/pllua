@@ -52,6 +52,7 @@ typedef struct luaP_Buffer {
 /* utils */
 void *luaP_toudata (lua_State *L, int ud, const char *tname);
 luaP_Buffer *luaP_getbuffer (lua_State *L, int n);
+int luaP_clearabort(lua_State *L);
 /* call handler API */
 lua_State *luaP_newstate (int trusted);
 void luaP_close (lua_State *L);

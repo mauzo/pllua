@@ -366,8 +366,7 @@ static int luaP_modinit (lua_State *L) {
       }
     }
   }
-  if (SPI_finish() != SPI_OK_FINISH)
-    elog(ERROR, "[pllua]: could not disconnect from SPI manager");
+  SPI_finish(); 
   return status;
 }
 
@@ -1171,8 +1170,7 @@ Datum luaP_validator (lua_State *L, Oid oid) {
     PG_RE_THROW();
   }
   PG_END_TRY();
-  if (SPI_finish() != SPI_OK_FINISH)
-    elog(ERROR, "[pllua]: could not disconnect from SPI manager");
+  SPI_finish();
   return 0; /* VOID */
 }
 
@@ -1180,6 +1178,7 @@ Datum luaP_callhandler (lua_State *L, FunctionCallInfo fcinfo) {
   Datum retval = 0;
   luaP_Info *fi;
   bool istrigger;
+  int abort;
   if (SPI_connect() != SPI_OK_CONNECT)
     elog(ERROR, "[pllua]: could not connect to SPI manager");
   istrigger = CALLED_AS_TRIGGER(fcinfo);
@@ -1249,11 +1248,13 @@ Datum luaP_callhandler (lua_State *L, FunctionCallInfo fcinfo) {
         retval = luaP_getresult(L, fcinfo, fi->result);
       }
     }
+    abort = luaP_clearabort(L);
     /* stack should be clean here: lua_gettop(L) == 0 */
   }
   PG_CATCH();
   {
     if (L != NULL) {
+      luaP_clearabort(L);
       luaP_cleantrigger(L);
       if (fi->result_isset && fi->L != NULL) /* clean thread? */
         luaP_cleanthread(L, &fi->L);
@@ -1264,8 +1265,8 @@ Datum luaP_callhandler (lua_State *L, FunctionCallInfo fcinfo) {
     PG_RE_THROW();
   }
   PG_END_TRY();
-  if (SPI_finish() != SPI_OK_FINISH)
-    elog(ERROR, "[pllua]: could not disconnect from SPI manager");
+  if (abort) luaP_error(L, "transaction");
+  SPI_finish();
   return retval;
 }
 
@@ -1273,22 +1274,28 @@ Datum luaP_callhandler (lua_State *L, FunctionCallInfo fcinfo) {
 /* ======= luaP_inlinehandler ======= */
 
 Datum luaP_inlinehandler (lua_State *L, const char *source) {
+  int abort;
   if (SPI_connect() != SPI_OK_CONNECT)
     elog(ERROR, "[pllua]: could not connect to SPI manager");
   PG_TRY();
   {
     if (luaL_loadbuffer(L, source, strlen(source), PLLUA_CHUNKNAME))
       luaP_error(L, "compile");
-    if (lua_pcall(L, 0, 0, 0)) luaP_error(L, "runtime");
+    if (lua_pcall(L, 0, 0, 0))
+      luaP_error(L, "runtime");
+    abort = luaP_clearabort(L);
   }
   PG_CATCH();
   {
-    if (L != NULL) lua_settop(L, 0); /* clear Lua stack */
+    if (L != NULL) {
+      luaP_clearabort(L);
+      lua_settop(L, 0); /* clear Lua stack */
+    }
     PG_RE_THROW();
   }
   PG_END_TRY();
-  if (SPI_finish() != SPI_OK_FINISH)
-    elog(ERROR, "[pllua]: could not disconnect from SPI manager");
+  if (abort) luaP_error(L, "transaction");
+  SPI_finish();
   PG_RETURN_VOID();
 }
 #endif
