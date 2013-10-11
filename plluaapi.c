@@ -85,10 +85,12 @@ static const char PLLUA_DATUM[] = "datum";
 #define resulterror(type) \
   elog(ERROR, "[pllua]: type '%s' (%d) not supported as result", \
       format_type_be(type), (type))
+#if 0
 #define luaP_error(L, tag) \
         ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), \
              errmsg("[pllua]: " tag " error"), \
              errdetail("%s", lua_tostring((L), -1))))
+#endif
 
 #define datum2string(d, f) \
   DatumGetCString(DirectFunctionCall1((f), (d)))
@@ -116,7 +118,7 @@ static Datum datumcopy (Datum dat, luaP_Typeinfo *ti) {
 }
 
 /* get MemoryContext for state L */
-static MemoryContext luaP_getmemctxt (lua_State *L) {
+MemoryContext luaP_getmemctxt (lua_State *L) {
   MemoryContext mcxt;
   lua_pushlightuserdata(L, (void *) L);
   lua_rawget(L, LUA_REGISTRYINDEX);

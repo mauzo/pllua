@@ -19,6 +19,7 @@ static const char PLLUA_TUPLEMT[] = "tuple";
 static const char PLLUA_PLANMT[] = "plan";
 static const char PLLUA_CURSORMT[] = "cursor";
 static const char PLLUA_TUPTABLEMT[] = "tupletable";
+static const char PLLUA_SQLERRMT[] = "sqlerr";
 
 typedef struct luaP_Tuple {
   int changed;
@@ -46,27 +47,9 @@ typedef struct luaP_Plan {
   Oid type[1];
 } luaP_Plan;
 
-#define luaP_TRY \
-    do { \
-        MemoryContext _tryctx = CurrentMemoryContext; \
-        ErrorData *_ed = NULL; \
-        \
-        PG_TRY();
-#define luaP_CATCH \
-        PG_CATCH(); \
-        { \
-            MemoryContextSwitchTo(_tryctx); \
-            _ed = CopyErrorData(); \
-            FlushErrorState(); \
-        } \
-        PG_END_TRY(); \
-        \
-        if (_ed) { \
-            lua_pushstring(L, _ed->message); \
-            FreeErrorData(_ed); \
-            return lua_error(L); \
-        } \
-    } while (0)
+typedef struct luaP_SQLerr {
+    ErrorData *ed;
+} luaP_SQLerr;
 
 /* ======= Utils ======= */
 
@@ -114,6 +97,57 @@ void luaP_pushdesctable (lua_State *L, TupleDesc desc) {
     lua_pushstring(L, NameStr(desc->attrs[i]->attname));
     lua_pushinteger(L, i);
     lua_rawset(L, -3); /* t[att] = i */
+  }
+}
+
+static void luaP_pushsqlerr (lua_State *L, ErrorData *ed) {
+  luaP_SQLerr *err = lua_newuserdata(L, sizeof(luaP_SQLerr));
+  err->ed = ed;
+  luaP_getfield(L, PLLUA_SQLERRMT);
+  lua_setmetatable(L, -2);
+}
+
+#define luaP_TRY \
+    do { \
+        MemoryContext _tryctx = CurrentMemoryContext; \
+        MemoryContext _luactx = luaP_getmemctxt(L); \
+        ErrorData *_ed = NULL; \
+        \
+        PG_TRY();
+#define luaP_CATCH \
+        PG_CATCH(); \
+        { \
+            MemoryContextSwitchTo(_luactx); \
+            _ed = CopyErrorData(); \
+            MemoryContextSwitchTo(_tryctx); \
+            FlushErrorState(); \
+        } \
+        PG_END_TRY(); \
+        \
+        if (_ed) { \
+            luaP_pushsqlerr(L, _ed); \
+            return lua_error(L); \
+        } \
+    } while (0)
+
+#if LUA_VERSION_NUM < 502
+static const char *luaL_tolstring(lua_State *L, int i, size_t *l) {
+  lua_getglobal(L, "tostring");
+  lua_pushvalue(L, ((i < 0) ? (i - 1) : i));
+  lua_call(L, 1, 1);
+  return lua_tolstring(L, -1, l);
+}
+#endif
+
+void luaP_error(lua_State *L, const char *tag) {
+  luaP_SQLerr *err;
+  if ((err = luaP_toudata(L, -1, PLLUA_SQLERRMT))) {
+    ReThrowError(err->ed);
+  }
+  else {
+    ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
+      errmsg("[pllua]: %s error", tag),
+      errdetail("%s", luaL_tolstring(L, -1, NULL))));
   }
 }
 
@@ -180,6 +214,57 @@ static void luaP_fillbuffer (lua_State *L, int pos, Oid *type,
   }
 }
 
+/* ======= SQLerr ======= */
+
+static char luaP_errlevels[][9] = {
+  "debug5", "debug4", "debug3", "debug2", "debug1",
+  "log", "commerr", "info", "notice", "warning", "error",
+  /* in practice neither of these will occur */
+  "fatal", "panic"
+};
+
+#define strseq(a, l, b) \
+  ((l) == (sizeof(b) - 1) && strncmp((a), (b), (l)) == 0)
+
+static int luaP_sqlerrindex (lua_State *L) {
+  luaP_SQLerr *e = lua_touserdata(L, 1);
+  size_t l;
+  const char *i = luaL_checklstring(L, 2, &l);
+  if (strseq(i, l, "context")) {
+    lua_pushstring(L, e->ed->context);
+  }
+  else if (strseq(i, l, "detail")) {
+    lua_pushstring(L, e->ed->detail);
+  }
+  else if (strseq(i, l, "hint")) {
+    lua_pushstring(L, e->ed->hint);
+  }
+  else if (strseq(i, l, "level")) {
+    lua_pushstring(L, luaP_errlevels[e->ed->elevel - DEBUG5]);
+  }
+  else if (strseq(i, l, "message")) {
+    lua_pushstring(L, e->ed->message);
+  }
+  else if (strseq(i, l, "sqlstate")) {
+    lua_pushstring(L, unpack_sql_state(e->ed->sqlerrcode));
+  }
+  else
+    lua_pushnil(L);
+  return 1;
+}
+
+static int luaP_sqlerrgc (lua_State *L) {
+  luaP_SQLerr *e = lua_touserdata(L, 1);
+  /* don't need to set the MemoryContext */
+  FreeErrorData(e->ed);
+  return 0;
+}
+
+static int luaP_sqlerrtostring (lua_State *L) {
+  luaP_SQLerr *e = lua_touserdata(L, 1);
+  lua_pushstring(L, e->ed->message);
+  return 1;
+}
 
 /* ======= Tuple ======= */
 
@@ -735,6 +820,13 @@ static const luaL_Reg luaP_Plan_mt[] = {
   {NULL, NULL}
 };
 
+static const luaL_Reg luaP_SQLerr_mt[] = {
+  {"__index", luaP_sqlerrindex},
+  {"__gc", luaP_sqlerrgc},
+  {"__tostring", luaP_sqlerrtostring},
+  {NULL, NULL}
+};
+
 void luaP_registerspi (lua_State *L) {
   /* tuple */
   luaP_newmetatable(L, PLLUA_TUPLEMT);
@@ -757,6 +849,10 @@ void luaP_registerspi (lua_State *L) {
   luaP_register(L, luaP_Plan_funcs);
   lua_setfield(L, -2, "__index");
   luaP_register(L, luaP_Plan_mt);
+  lua_pop(L, 1);
+  /* sqlerr */
+  luaP_newmetatable(L, PLLUA_SQLERRMT);
+  luaP_register(L, luaP_SQLerr_mt);
   lua_pop(L, 1);
   /* SPI */
   lua_newtable(L);
