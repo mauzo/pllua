@@ -13,6 +13,7 @@
 #endif
 
 #define SPI_plan void
+static const char PLLUA_UDTYPES[] = "luaP_UDtypes";
 static const char PLLUA_BUFFER[] = "luaP_Buffer";
 static const char PLLUA_TUPTABLE[] = "luaP_Tuptable";
 static const char PLLUA_TUPLEMT[] = "tuple";
@@ -65,6 +66,11 @@ static int luaP_typeerror (lua_State *L, int narg, const char *tname) {
 
 static void luaP_newmetatable (lua_State *L, const char *tname) {
   lua_newtable(L);
+  luaP_getfield(L, PLLUA_UDTYPES);
+  lua_pushstring(L, tname);
+  lua_pushvalue(L, -3);
+  lua_rawset(L, -3);
+  lua_pop(L, 1);
   lua_pushlightuserdata(L, (void *) tname);
   lua_pushvalue(L, -2);
   lua_rawset(L, LUA_REGISTRYINDEX);
@@ -88,6 +94,20 @@ static void *luaP_checkudata (lua_State *L, int ud, const char *tname) {
   void *p = luaP_toudata(L, ud, tname);
   if (p == NULL) luaP_typeerror(L, ud, tname);
   return p;
+}
+
+static int luaP_isudata (lua_State *L) {
+  if (!lua_isuserdata(L, 1) || !lua_getmetatable(L, 1)) {
+    lua_pushnil(L);
+  }
+  else {
+    luaP_getfield(L, PLLUA_UDTYPES);
+    lua_pushvalue(L, 2);
+    lua_rawget(L, -2);
+    if (!lua_isnil(L, -1))
+      lua_pushboolean(L, lua_rawequal(L, -1, -3));
+  }
+  return 1;
 }
 
 void luaP_pushdesctable (lua_State *L, TupleDesc desc) {
@@ -766,6 +786,11 @@ static int luaP_rows (lua_State *L) {
 
 /* ======= luaP_registerspi ======= */
 
+static const luaL_Reg luaP_SPI_global_funcs[] = {
+  {"isudata", luaP_isudata},
+  {NULL, NULL}
+};
+
 static const luaL_Reg luaP_Plan_funcs[] = {
   {"execute", luaP_executeplan},
   {"save", luaP_saveplan},
@@ -828,6 +853,13 @@ static const luaL_Reg luaP_SQLerr_mt[] = {
 };
 
 void luaP_registerspi (lua_State *L) {
+  /* globals defined in this file */
+  lua_pushlightuserdata(L, (void *)PLLUA_UDTYPES);
+  lua_newtable(L);
+  lua_rawset(L, LUA_REGISTRYINDEX);
+  lua_pushglobaltable(L);
+  luaP_register(L, luaP_SPI_global_funcs);
+  lua_pop(L, 1);
   /* tuple */
   luaP_newmetatable(L, PLLUA_TUPLEMT);
   luaP_register(L, luaP_Tuple_mt);
